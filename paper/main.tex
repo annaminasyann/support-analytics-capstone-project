@@ -1,0 +1,692 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\graphicspath{{./figures/}{./}}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\setlength{\textfloatsep}{4pt plus 1pt minus 1pt}
+\setlength{\floatsep}{4pt plus 1pt minus 1pt}
+\setlength{\intextsep}{4pt plus 1pt minus 1pt}
+\setlength{\abovecaptionskip}{2pt}
+\setlength{\belowcaptionskip}{0pt}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+\thispagestyle{empty}
+\pagestyle{empty}
+
+\title{Automated Insights for Multilingual Support Chatbots: Density-Based Clustering and Failure Analysis}
+
+\author{
+  \IEEEauthorblockN{Anna Minasyan}
+  \IEEEauthorblockA{Akian College of Science and Engineering\\
+    American University of Armenia\\
+    Yerevan, Armenia\\
+    anna\_minasyan@edu.aua.am}
+  \and
+  \IEEEauthorblockN{Armen Saghatelian, PhD}
+  \IEEEauthorblockA{Supervisor\\
+    10Web Inc.\\
+    Yerevan, Armenia\\
+    armen@10web.io}
+}
+
+\maketitle
+
+\begin{abstract}
+Support chatbots at SaaS companies process thousands of conversations daily across dozens of languages, all unlabeled. There is no scalable way to discover what users struggle with, which issue types fail most, or how to forecast demand. A single conversation often covers several unrelated intents: embedding it as one vector mixes those intents and hides the structure that quality improvement requires.
+
+This paper groups 46{,}445 conversations from the 10Web AI chatbot (May--November 2025, 93 languages, 1{,}007{,}000 messages) into 169{,}709 topically coherent chunks, then applies two-stage contrastive fine-tuning and UMAP+HDBSCAN clustering. The result is 24 cross-lingual intent clusters (Silhouette $= 0.804$, DBCV $= 0.547$, 12\% noise), an 8.8-fold Silhouette improvement over conversation-level baselines, with each cluster mapping to a distinct operational support topic. Contrastive fine-tuning drops noise from 47\% to 12\% with no human annotation. Chunk-weighted failure analysis identifies a 7.5\% headline failure rate across 3{,}491 conversations; conversation-level attribution overstates per-cluster risk by up to 11-fold, which chunk-weighting corrects by attributing failure to the causing intent. Three intent categories emerge with failure rates above 18\%: HTTP server-down and error-code diagnosis (19.2\%), Cloudflare CDN and DNS configuration (18.7\%), and free-trial plan limitations (18.0\%) — each identifying a specific knowledge-base gap where the chatbot most systematically fails to resolve user queries. OLS trend analysis shows 13 of 24 clusters declined significantly in weekly volume ($p < 0.05$); daily Prophet forecasting reaches wMAE $= 10.7$ chunks/day (MASE $= 0.736$), beating naive persistence by 29\% across six clusters and 11 cross-validation folds.
+\end{abstract}
+
+\begin{IEEEkeywords}
+intent discovery, semantic chunking, contrastive fine-tuning, sentence transformers, HDBSCAN, UMAP, multilingual NLP, customer support analytics, chatbot failure analysis, density-based clustering
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:intro}
+
+Customer support in cloud-based SaaS platforms is increasingly handled by AI-driven chatbots, which must simultaneously manage hundreds of distinct user intents across languages, product areas, and skill levels \cite{adamopoulou2020chatbot}. When a chatbot fails to resolve a query, the user either submits a negative rating or requests escalation to a human agent, raising operational cost and reducing satisfaction \cite{xu2017new}. At the scale studied here, roughly 1{,}500 new conversations arrive per week; a 7.5\% headline failure rate means approximately 112 unresolved conversations every week, each one a potential churn signal and a direct cost in agent time. Identifying which intent categories drive that failure is the first requirement for systematic improvement, yet this requires first discovering what those categories are, without manual annotation and without assuming the topic taxonomy is known in advance.
+
+Existing approaches to intent discovery operate at utterance or full-conversation granularity and either require a pre-specified number of clusters or depend on human-annotated labels \cite{liu2016attention, perkins2019dialog}. Neither assumption holds in a production multilingual chatbot where the topic taxonomy is unknown, continuously evolving, and never annotated. This gap motivates the present work.
+
+The straightforward baseline is to embed each conversation as a single vector. The problem is that within-conversation topic transitions disappear: a user who asks about DNS configuration, then pivots to a billing dispute, and finally requests a refund produces one embedding that is the arithmetic mean of three semantically distinct intents. Averaged representations inflate intra-cluster variance and suppress the signal that density-based clustering needs to find tight, interpretable groups, as the preliminary study in Section~\ref{sec:prelim} confirms empirically.
+
+This paper addresses that representation problem with semantic chunking: the messages of each conversation are grouped into coherent sub-conversation segments before embedding, so each unit of analysis carries one focused intent. Combined with contrastive fine-tuning that targets the support domain, and density-based clustering that does not need a pre-specified cluster count, the chunk-level approach gives tighter, more separable cluster structure than either TF-IDF baselines or conversation-level embeddings. As a methodological contribution, we show that standard conversation-level failure rate estimates overstate per-cluster risk by up to 11-fold; chunk-weighted aggregation corrects this by attributing failure to the specific intent that caused it.
+
+The research questions are:
+
+\begin{description}
+  \item[RQ1] To what extent does sub-conversation chunking, combined with two-stage contrastive fine-tuning on cluster pseudo-labels, improve intent cluster quality over full-conversation embeddings when the corpus, embedding model family, and clustering algorithm are held fixed?
+  \item[RQ2] Which intent categories carry the highest chatbot failure signal, and how much does conversation-level failure attribution overstate per-cluster risk relative to chunk-weighted attribution on the same data?
+  \item[RQ3] How much of the cluster-quality improvement is attributable to contrastive fine-tuning versus chunk-level segmentation, and how does cluster quality evolve across the two bootstrapped self-training rounds without human annotation?
+  \item[RQ4] At what temporal granularity can per-cluster chunk volume be forecast with accuracy exceeding a seasonal naive baseline, and what explains the divergence in model rankings between daily and weekly aggregation on the same underlying series?
+\end{description}
+
+\section{Related Work}
+
+\subsection{Intent Discovery in Dialogue Systems}
+
+Early intent detection relied on supervised classification over predefined taxonomies \cite{liu2016attention}. These approaches require labelled training data and break down when the taxonomy is incomplete or evolves with the product; this is a fundamental limitation in production systems where support topics shift with each product release. Zhang et al.~\cite{zhang2021new} proposed open-world intent discovery with pre-trained language models, clustering utterance-level representations of unseen intents outside the supervised schema; a follow-on study~\cite{zhang2022intent} demonstrated that adding in-domain contrastive pre-training further improves open-intent cluster quality without human annotation. Perkins and Yang~\cite{perkins2019dialog} extended this to multi-view clustering, treating the user query and agent response as complementary views of the same dialogue turn and proposing alternating-view K-Means for joint representation learning and cluster assignment. Both operate at the utterance level and require a pre-specified cluster count, a constraint that HDBSCAN~\cite{campello2013density} avoids. Neither addresses the multi-topic structure of full support conversations, where embedding at conversation granularity mixes distinct intents into a single vector. This within-conversation granularity problem has received little attention in the intent discovery literature. The contribution of the present work is to show empirically, on the same 46{,}445-conversation corpus with the embedding model and clustering algorithm held fixed, that decomposing conversations into coherent sub-segments before embedding closes the quality gap and accounts for the 8.8-fold Silhouette improvement over conversation-level representations.
+
+\subsection{Sentence Embeddings and Contrastive Learning}
+
+Reimers and Gurevych~\cite{reimers2019sentence} introduced Sentence-BERT (SBERT), producing fixed-size sentence representations by fine-tuning BERT with a Siamese network on Natural Language Inference pairs. The multilingual extension of this family, \texttt{paraphrase-multilingual-MiniLM-L12-v2}~\cite{wang2020minilm}, supports over 50 languages at 384 dimensions with paraphrase detection performance at a fraction of the cost of larger models. More recent multilingual encoders extend contrastive pre-training to 100+ languages at larger scale~\cite{wang2024e5}; we retain MiniLM for its lower encoding cost and established paraphrase-detection performance at comparable multilingual coverage. A limitation shared by all off-the-shelf sentence encoders is that they are trained on general-domain corpora; domain-specific terminology and failure patterns in SaaS support are not represented, which weakens cluster separability without adaptation.
+
+Gao et al.~\cite{gao2021simcse} showed that contrastive objectives with in-batch negatives substantially improve sentence embedding quality on semantic similarity benchmarks, even when the only supervision comes from cluster labels. Standard contrastive training still requires either human-annotated pairs or carefully curated augmentations; SimCSE uses random dropout as augmentation, which does not inject domain knowledge. Our contrastive fine-tuning strategy applies this principle using HDBSCAN cluster assignments as domain-specific pseudo-labels, removing the need for human annotation entirely.
+
+\subsection{Dimensionality Reduction and Density-Based Clustering}
+
+McInnes et al.~\cite{mcinnes2018umap} showed that UMAP preserves both local neighbourhood structure and global topology while scaling to hundreds of thousands of points; it works well as a preprocessing step for density-based clustering of high-dimensional text embeddings. HDBSCAN~\cite{campello2013density} extends DBSCAN by constructing a cluster hierarchy across all density thresholds and extracting the most persistent clusters, eliminating the need for a pre-specified cluster count while explicitly labelling low-density points as noise. Both make the combination well-suited to support intent discovery, where the number and shape of intent groups is not known in advance.
+
+Moulavi et al.~\cite{moulavi2014dbcv} introduced DBCV, a cluster validity index designed specifically for density-based solutions. Unlike Silhouette, which measures point-to-centroid ratios and is not calibrated for density-connected clusters, DBCV measures the ratio of intra-cluster density to inter-cluster density separation, making it a more appropriate validity criterion for HDBSCAN outputs. The combination of UMAP, HDBSCAN, and DBCV validation adopted in this paper does not appear in the literature as applied to sub-conversation chunk-level intent discovery; the empirical comparison in Section~\ref{sec:prelim} and Table~\ref{tab:metrics} is, to our knowledge, the first to isolate the granularity effect from the encoder and algorithm by holding both constant on the same 46{,}445-conversation corpus.
+
+\subsection{Customer Support Analytics and Chatbot Failure}
+
+Xu et al.~\cite{xu2017new} found that negative sentiment and repetitive queries are the strongest escalation precursors in hybrid human-bot systems; F{\o}lstad and Brandtzaeg~\cite{folstad2017chatbots} add that exit behaviour (abandonment or an explicit escalation request) is the most reliable non-intrusive failure indicator in production deployments. Brandtzaeg and F{\o}lstad~\cite{brandtzaeg2017people} categorised chatbot failure modes into understanding failures, task completion failures, and interaction quality failures. Our three-tier failure taxonomy borrows that distinction and operationalises it through lightweight message-level signals that need no model retraining and work in any pipeline with access to conversation metadata. All of the above work, however, treats the support topic taxonomy as known or fixed to observed escalation categories. Without a mechanism for discovering what intent categories actually exist in an unlabelled corpus, practitioners cannot stratify failure rates by topic, route emerging issue types before they accumulate failure signal, or forecast demand at cluster granularity. The intent discovery pipeline in the present work is designed to close that gap by making both the topic structure and the per-topic quality picture emerge from the same unsupervised system.
+
+\section{Methodology}
+\label{sec:methodology}
+
+Figure~\ref{fig:pipeline} shows the end-to-end pipeline from raw conversation data through de-identification, semantic chunking, contrastive fine-tuning, and density-based clustering to the downstream failure and temporal analyses.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=\textwidth]{pipeline_plot.png}
+  \caption{End-to-end pipeline overview. Raw 10Web AI chatbot conversations undergo a three-step de-identification procedure, then coherence-threshold semantic chunking into topically self-contained segments. Chunks are first embedded with Google's \texttt{text-multilingual-embedding-002} (768-D) via BigQuery ML to produce pseudo-labels for contrastive fine-tuning of \texttt{paraphrase-multilingual-MiniLM-L12-v2}. After two bootstrap cycles, all chunks are re-encoded with the fine-tuned model (384-D), reduced to 10-D with UMAP, and clustered with HDBSCAN. Downstream analyses then produce chunk-weighted failure attribution and daily temporal forecasting at cluster granularity. The figure itself is drawn programmatically by the first code cell of \texttt{notebooks/02\_explore\_clusters.ipynb}.}
+  \label{fig:pipeline}
+\end{figure*}
+
+\subsection{Dataset and De-identification}
+
+10Web is a cloud-based WordPress platform combining AI-assisted website generation with managed hosting (CDN, SSL, DNS). Its non-technical user base spans individual entrepreneurs and small business owners, so support queries range from simple builder questions to low-level infrastructure issues such as DNS propagation failures, HTTP 5xx errors, and CDN cache invalidation.
+
+Customer interactions go through an embedded AI chatbot accessible directly from the 10Web dashboard. The chatbot is the first line of support before any human agent is involved. After each chatbot response the user can submit a binary rating: a thumbs-up ($+1$) or thumbs-down ($-1$) button rendered inline in the chat. The thumbs-down rating requires a deliberate click and represents an explicit negative judgement on the response. The platform stores this rating at the conversation level: a conversation is marked as negatively rated if any response within it receives a thumbs-down. Because the rating requires active user effort, it is a high-precision but low-recall failure signal; we use it as the Tier 1 confirmed failure indicator.
+
+The study corpus is 46{,}445 customer support conversations spanning May to November 2025 (31 calendar weeks), with approximately 1{,}007{,}000 message-level rows. Messages are aggregated by \texttt{conversation\_id}, ordered chronologically, then segmented into chunks within each conversation by the procedure in Section~\ref{sec:chunking}. This period covers the initial product launch surge in late May 2025, which peaked at 2{,}076 conversations in the week of 25 May 2025, followed by gradual normalisation to approximately 1{,}275 conversations per week by November 2025. Conversations span 93 detected languages, with English accounting for 86.3\% of all conversations, followed by Spanish (2.3\%), French (1.8\%), Portuguese (1.3\%), German (1.1\%), and Arabic (1.0\%). The remaining 6.1\% is distributed across 87 additional languages.
+
+We applied a three-step de-identification pipeline before any analysis. Step 1: custom regular expressions masked emails, URLs, API keys, IP addresses, phone numbers, credit card patterns, passwords, OTPs, and national identifiers (BigQuery script \texttt{02\_deidentify.sql}). Step 2: SHA256 pseudonymised all identifier columns (\texttt{conversation\_id}, \texttt{client\_id}, digests). Step 3: Microsoft Presidio~\cite{mendez2019presidio} with language-routed NER (English: \texttt{en\_core\_web\_lg}; other languages: multilingual spaCy) caught person, location, and organisation entities across all 93 languages; two custom recognisers handled \texttt{DOMAIN\_NAME} and \texttt{ACCOUNT\_ID} patterns. All analysis was performed inside the Google Cloud project \texttt{support-analytics-492410} (region: europe-west1) with no raw personal data exported.
+
+\subsection{Semantic Chunking}
+\label{sec:chunking}
+
+Within each conversation, consecutive messages are grouped into semantically coherent chunks using a coherence-threshold chunking model (\texttt{scripts/semantic\_chunker.py}). Before boundary detection, a boilerplate filter removes scripted agent utterances (greetings, automated acknowledgements, and closing statements; approximately 200 phrase patterns) and messages with fewer than two tokens, so conversational scaffolding does not inflate within-chunk coherence. The chunker accumulates messages into a growing current chunk and inserts a boundary between positions $t$ and $t{+}1$ when the cosine similarity between the mean embedding of the current chunk and the embedding of the next candidate message falls below a calibrated threshold:
+\begin{equation}
+  \mathrm{sim}(\bar{w}_t,\, e_{t+1})
+  = \frac{\bar{w}_t \cdot e_{t+1}}{\|\bar{w}_t\|\,\|e_{t+1}\|}
+  < \theta
+  \label{eq:chunk}
+\end{equation}
+where $\bar{w}_t$ is the embedding of the concatenated text of all messages in the current chunk (computed by encoding the joined text as a single vector) and $e_{t+1}$ is the embedding of the next candidate message. A token-budget ceiling provides a hard upper bound on chunk length independent of the cosine criterion, preventing pathologically long chunks in low-coherence-shift conversations. Each resulting chunk receives a unique identifier of the form \texttt{\{conversation\_id\}\_\_c\{sequence\}}, preserving provenance.
+
+This yields 169{,}709 chunks from 46{,}445 conversations, a mean of 3.6 chunks per conversation and a median of 2. Embeddings are computed directly from the original multilingual chunk text, since the embedding model chosen in the next step supports over 50 languages natively.
+
+\subsection{Embedding Model Selection and Chunk Embeddings}
+
+We evaluated four multilingual sentence encoders in the conversation-level baseline experiment under identical UMAP and HDBSCAN settings to select a model for the full chunk pipeline: \texttt{paraphrase-multilingual-MiniLM-L12-v2} (384-D)~\cite{wang2020minilm}, \texttt{all-mpnet-base-v2} (768-D), \texttt{distiluse-base-multilingual-cased-v2} (512-D), and LaBSE (768-D). LaBSE achieved the highest cosine Silhouette at conversation level (0.692) but collapsed to 6 clusters, far below the granularity needed for intent discovery. MiniLM produced competitive separation across both multilingual and pre-translated tracks at 44\% lower encoding cost than mpnet, and its paraphrase training objective aligns well with the goal of grouping semantically equivalent queries regardless of surface phrasing. We therefore selected MiniLM as the model to fine-tune.
+
+Initial chunk embeddings are generated with Google's \texttt{text-multilingual-embedding-002} (768-D) via BigQuery ML.GENERATE\_EMBEDDING, applied directly to the original multilingual chunk text without prior translation. This model places all 93 languages into one shared vector space and provides the initial representations from which pseudo-labels are derived. Translation is retained at the conversation level (Section~\ref{sec:baseline}) because the conversation-level baseline includes a TF-IDF track with English stopword filtering, both of which are language-specific; the chunk-level pipeline operates entirely on the multilingual embedding model and the language-agnostic clustering algorithm, so translating the chunk text would only introduce noise from machine translation errors without buying any benefit.
+
+\subsection{Contrastive Fine-Tuning}
+\label{sec:finetune}
+
+We apply contrastive fine-tuning (\texttt{scripts/contrastive\_finetune.py}) using a two-stage bootstrapping procedure to improve within-domain cluster separation.
+
+In the first stage, UMAP and HDBSCAN run on the 768-D Google model embeddings to produce initial cluster assignments used as pseudo-labels. In the second stage, per-anchor training pairs are constructed: 50 positive pairs are sampled by drawing chunks from the same pseudo-label cluster. Hard negatives (nearest-neighbour chunks from a different cluster in embedding space) and easy negatives (randomly drawn from other clusters) are also mined and stored for pair quality analysis, but are not passed to the training objective directly; MNRL uses all other in-batch positives as implicit negatives. The \texttt{paraphrase-multilingual-MiniLM-L12-v2} model~\cite{wang2020minilm} is fine-tuned for 3 epochs with Multiple Negatives Ranking Loss (MNRL)~\cite{gao2021simcse}:
+\begin{equation}
+  \mathcal{L}_{\mathrm{MNRL}}
+  = -\frac{1}{N}\sum_{i=1}^{N}
+    \log\frac{e^{\,\mathrm{sim}(a_i,\,p_i)/\tau}}
+             {\displaystyle\sum_{j=1}^{N} e^{\,\mathrm{sim}(a_i,\,p_j)/\tau}}
+  \label{eq:mnrl}
+\end{equation}
+where $a_i$ is an anchor chunk embedding, $p_i$ is a positive (same-cluster) embedding, all other in-batch chunks $\{p_j\}_{j \neq i}$ act as implicit negatives, $\mathrm{sim}(\cdot,\cdot)$ denotes cosine similarity as in Eq.~(\ref{eq:chunk}), and $\tau$ is a temperature parameter.
+
+All 169{,}709 chunks are then re-encoded with the fine-tuned MiniLM model, producing $\ell_2$-normalised 384-D domain-specific vectors (\texttt{chunk\_embeddings\_finetuned.npy}), and re-clustered. This cycle runs twice: the second round benefits from the cleaner pseudo-labels the first round produces. No human annotation enters at any stage; the supervision signal comes entirely from the structure of the embedding space, so the method transfers to new domains without modification.
+
+\subsection{Dimensionality Reduction and Clustering}
+\label{sec:method-cluster}
+
+Fine-tuned 384-dimensional embeddings are reduced to 10 dimensions with UMAP~\cite{mcinnes2018umap} ($n\_neighbors{=}30$, $min\_dist{=}0.0$, cosine metric), then clustered with HDBSCAN~\cite{campello2013density,mcinnes2017hdbscan} ($min\_cluster\_size{=}2{,}000$, $min\_samples{=}20$, \texttt{leaf} cluster selection, membership confidence threshold 0.70). Density-based clustering is preferred over centroid-based alternatives such as K-Means or Gaussian Mixture Models because it requires no pre-specified cluster count $k$, explicitly labels ambiguous low-density points as noise rather than forcing cluster membership, and makes no shape assumptions, all properties essential when the number of support intent groups and their geometry are unknown a priori. These hyperparameters were selected from a sweep of 90 configurations spanning UMAP components $\in \{10,\, 15,\, 20\}$, $min\_cluster\_size \in \{1{,}000,\, 1{,}500,\, 1{,}800,\, 2{,}000,\, 2{,}500\}$, $min\_samples \in \{10,\, 15,\, 20\}$, and both \texttt{leaf} and \texttt{eom} selection methods; the reported configuration maximises cosine Silhouette while keeping noise below 15\%. A separate 2-dimensional UMAP projection ($min\_dist{=}0.4$, balanced per-cluster subsample of 2{,}000 chunks for fitting, full corpus via transform) is used exclusively for visualisation and does not enter any metric computation.
+
+Cluster labels and 2-dimensional UMAP coordinates are written to BigQuery (\texttt{chunk\_cluster\_labels}). Each cluster then undergoes a two-pass Gemini labelling step (\texttt{07\_chunk\_evaluation.sql}). First, a per-cluster profile is assembled: chunk and conversation counts, failure rates by tier, escalation rates, HDBSCAN membership probabilities, and 15--25 representative chunks sampled by distance ring (ring~1 = cluster core, ring~5 = boundary) and by failure stratum (confirmed negative, probable failure, positive, abandoned, etc.). These profiles are passed to \texttt{BigQuery ML.GENERATE\_TEXT} with Gemini~2.5~Flash~\cite{gemini2025}, which returns a structured analysis covering the cluster theme, a failure diagnosis with specific counts, a suggested knowledge-base action, and verbatim evidence quotes from the chunk sample. A second Gemini call distils this analysis into a 3--6 word cluster title. Both outputs are stored in \texttt{chunk\_cluster\_descriptions}, the authoritative lookup for all downstream analyses; neither influences the clustering algorithm or any computed metric.
+
+\subsection{TF-IDF Baselines}
+
+A TF-IDF matrix (15{,}000 features, unigrams and bigrams, $min\_df{=}3$, sublinear TF scaling) is reduced to 100 dimensions with Truncated SVD (Latent Semantic Analysis)~\cite{deerwester1990indexing} and $\ell_2$-normalised. K-Means ($k{=}24$, matching HDBSCAN cluster count, 10 random restarts) and Agglomerative Ward clustering ($k{=}24$, fitted on a 10{,}000-chunk stratified subsample and extended via Nearest Centroid assignment) give the hard-partition bag-of-words baselines that the support-clustering literature defaults to.
+
+\subsection{Evaluation Metrics}
+
+Four intrinsic clustering metrics are reported. Silhouette~\cite{rousseeuw1987silhouettes} is computed in raw cosine embedding space (sample of 10{,}000 chunks for computational feasibility). For chunk $i$ with mean intra-cluster distance $a(i)$ and mean distance to the nearest other cluster $b(i)$:
+\begin{equation}
+  s(i) = \frac{b(i) - a(i)}{\max\bigl\{a(i),\,b(i)\bigr\}},
+  \quad s(i) \in [-1,\,1]
+  \label{eq:silhouette}
+\end{equation}
+Values above 0.70 indicate strong cluster structure. Davies-Bouldin Index~\cite{davies1979cluster} (lower is better) measures the ratio of intra-cluster scatter to inter-cluster separation in UMAP-10D Euclidean space. Calinski-Harabasz~\cite{calinski1974dendrite} (higher is better) measures the ratio of between-cluster to within-cluster dispersion. DBCV~\cite{moulavi2014dbcv} (range $[-1, 1]$, higher is better) measures density-based cluster validity in UMAP-10D Euclidean space and is the most appropriate metric for HDBSCAN outputs because it does not assume convex or spherical cluster shapes.
+
+\subsection{Three-Tier Failure Taxonomy}
+\label{sec:failure-method}
+
+Each conversation is classified using a three-tier failure framework based on observable signals in the conversation metadata. This taxonomy operationalises Brandtzaeg and F{\o}lstad's~\cite{brandtzaeg2017people} three chatbot failure categories: Tier~1 corresponds to task completion failures (the user's explicit thumbs-down signals the response was rejected), Tier~2 to interaction quality failures (detectable through behavioural signals without navigating the rating interface), and Tier~3 to understanding failures (ambiguous signals where the chatbot may have misinterpreted the query).
+
+\begin{itemize}
+  \item Tier 1 (Confirmed): The user submitted an explicit thumbs-down rating (rating score $-1$). This is the highest-confidence failure signal, requiring deliberate negative action from the user.
+  \item Tier 2 (Probable): The conversation is unrated and contains a repetition loop (two consecutive near-duplicate client messages with Levenshtein distance below 5 on strings of 10 or more characters) or an unserved agent-handoff request (regex detection on client message text). These are strong behavioural failure signals that do not require the user to navigate the rating interface.
+  \item Tier 3 (Suspected): Ambiguous signals including escalation without rating and abandoned inquiry (first-message exit with no follow-up). These are reported separately and not included in the headline rate.
+\end{itemize}
+
+The headline failure rate is Tier 1 union Tier 2. Failure labels are joined from \texttt{failure\_flags} to \texttt{chunk\_cluster\_labels} and aggregated at the cluster level. Chunk-weighted failure rates use the total chunk count in each cluster as the denominator, not conversation count. For cluster $c$, let $\mathcal{V}_c$ be the set of all conversations contributing at least one chunk to $c$, $\mathcal{F} = T_1 \cup T_2$ the set of failing conversations, and $n_v(c)$ the number of chunks conversation $v$ contributes to $c$. Then:
+\begin{equation}
+  \mathrm{FR}_c
+  = \frac{\displaystyle\sum_{v\,\in\,\mathcal{V}_c \cap \mathcal{F}} n_v(c)}
+         {\displaystyle\sum_{v\,\in\,\mathcal{V}_c} n_v(c)}
+  \label{eq:chunkfr}
+\end{equation}
+This prevents large clusters from inheriting inflated failure rates when a failing conversation touches multiple intent clusters.
+
+\subsection{Temporal Analysis and Forecasting}
+
+Weekly chunk volume per cluster is extracted from \texttt{chunk\_cluster\_trends} (BigQuery view derived from \texttt{06\_trends.sql}). Aggregate and per-cluster time series are analysed with Augmented Dickey-Fuller stationarity tests and Ljung-Box autocorrelation tests. Cluster-level linear trends are estimated via ordinary least squares regression of chunk count on week index; a cluster is classified as declining if its OLS slope is below $-0.05$ chunks per week with $p < 0.05$ (two-tailed).
+
+Operational forecasting is evaluated on daily chunk counts per cluster, which exposes the intra-week demand pattern (weekday--weekend fluctuation) that weekly aggregation masks. Two models are compared against a naive last-day baseline across the six largest clusters using expanding-window cross-validation (minimum training window 56 days, holdout 14 days, stride 14 days, 11 folds per cluster): Facebook Prophet~\cite{taylor2018forecasting} with weekly seasonality enabled (\texttt{weekly\_seasonality=True}); and Holt-Winters exponential smoothing with a 7-day seasonal period (\texttt{trend='add'}, \texttt{seasonal='add'}, \texttt{seasonal\_periods=7}). Four accuracy measures are reported. The volume-weighted MAE (wMAE) weights each cluster's error by its share of total chunk traffic:
+\begin{equation}
+  \mathrm{wMAE} = \sum_{c \in C} w_c\,\mathrm{MAE}_c,
+  \quad w_c = \frac{\mathrm{vol}_c}{\displaystyle\sum_{c'} \mathrm{vol}_{c'}}
+  \label{eq:wmae}
+\end{equation}
+The mean absolute scaled error (MASE) normalises by the in-sample lag-$m$ seasonal naive MAE, so $\mathrm{MASE}{<}1$ indicates the model beats the seasonal naive:
+\begin{equation}
+  \mathrm{MASE} =
+  \frac{\mathrm{MAE}}
+       {\dfrac{1}{T-m}\displaystyle\sum_{t=m+1}^{T}\bigl|y_t - y_{t-m}\bigr|}
+  \label{eq:mase}
+\end{equation}
+with $m{=}7$ (weekly period for daily data). MAPE (zero-volume days excluded) is also reported. A supplementary weekly-level analysis (minimum training window 8 weeks, 23 folds per cluster, non-seasonal models including auto-ARIMA with Diebold-Mariano tests~\cite{diebold1995dm}) is conducted and reported as a sensitivity check to characterise the effect of the May--June 2025 launch spike at weekly granularity.
+
+\section{Preliminary Study: Conversation-Level Clustering}
+\label{sec:baseline}
+\label{sec:prelim}
+
+Before developing the chunk pipeline, we ran a controlled experiment on full-conversation embeddings to establish a comparable baseline. Google's \texttt{text-multilingual-embedding-002} (768 dimensions, accessed via BigQuery ML.GENERATE\_EMBEDDING) was applied to 46{,}445 de-identified conversations under a two-track design: Track A embedded the original multilingual text, Track B embedded Cloud Translation API-translated English text. Both tracks used identical UMAP and HDBSCAN hyperparameters ($n\_components{=}20$, $n\_neighbors{=}15$; $min\_cluster\_size{=}150$, $min\_samples{=}15$, \texttt{euclidean} metric), discovering $k{=}70$ clusters in both cases.
+
+HDBSCAN achieved Silhouette scores of 0.077 (Track A) and 0.091 (Track B), against 0.059 for TF-IDF K-Means. Pre-translation improved DBCV from 0.322 to 0.462 (43\%), suggesting that translation tightens density-connected cluster structure even when the embedding model handles multiple languages natively. Noise rates were 34\% (Track A) and 37\% (Track B), compared with 12\% in the chunk pipeline.
+
+These results exposed two problems. Silhouette values below 0.10 indicate that conversation-level embeddings, even from a large multilingual model, do not produce well-separated clusters on this corpus. High noise rates indicate that many conversations are semantically ambiguous at the full-conversation level but become classifiable once the embedded unit is a coherent sub-conversation segment. Both motivated the move to chunk-level analysis.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Dataset Summary}
+
+Table~\ref{tab:dataset} provides a statistical summary of the research corpus.
+
+\begin{table}[!t]
+\caption{Dataset Statistics (May to November 2025)}
+\label{tab:dataset}
+\centering
+\begin{tabular}{lr}
+\toprule
+Attribute & Value \\
+\midrule
+Total conversations              & 46{,}445 \\
+Total messages                   & ${\sim}1{,}007{,}000$ \\
+Total semantic chunks            & 169{,}709 \\
+Mean chunks per conversation     & 3.6 \\
+Median chunks per conversation   & 2 \\
+Weeks of data                    & 31 \\
+Languages detected               & 93 \\
+English conversations            & 86.3\% \\
+Peak weekly conversations        & 2{,}076 (25 May 2025) \\
+Average weekly conversations     & 1{,}498 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Clustering Quality}
+
+Table~\ref{tab:metrics} presents intrinsic clustering metrics for all methods. The chunk-level HDBSCAN pipeline with fine-tuned embeddings beats all baselines on every metric.
+
+\begin{table*}[!t]
+\caption{Clustering Evaluation Metrics. TF-IDF Silhouette, D-B, and C-H computed in LSA-100D Euclidean space. Conversation-level HDBSCAN Silhouette in raw 768-D cosine space; DBCV in UMAP-20D Euclidean space. Chunk-level Silhouette in raw 384-D cosine space (sample of 10{,}000); D-B, C-H, and DBCV in UMAP-10D Euclidean space. `N/A' indicates the metric is not computable for this configuration.}
+\label{tab:metrics}
+\centering
+\begin{tabular}{lcccccc}
+\toprule
+Method & k & Noise\% &
+  Sil.$\uparrow$ & D-B$\downarrow$ &
+  C-H$\uparrow$ & DBCV$\uparrow$ \\
+\midrule
+TF-IDF + K-Means (LSA-100D)               & 24 & 0.0  & 0.143 & 2.624 & 3{,}714   & N/A   \\
+TF-IDF + Ward (LSA-100D)                  & 24 & 0.0  & 0.147 & 2.483 & 3{,}791   & N/A   \\
+Conv.-level HDBSCAN (768-D, multilingual) & 70 & 34.0 & 0.077 & 0.593 & 29{,}188  & 0.322 \\
+Conv.-level HDBSCAN (768-D, translated)   & 70 & 37.0 & 0.091 & 0.559 & 28{,}878  & 0.462 \\
+Chunk HDBSCAN (fine-tuned, 384-D) & 24 & 12.0 &
+  0.804 & 0.240 & 382{,}279 & 0.547 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The chunk-level pipeline achieves Silhouette $= 0.804$, which exceeds Rousseeuw's~\cite{rousseeuw1987silhouettes} strong-cluster threshold of 0.70 and is 8.8$\times$ the best conversation-level result (0.091) on the same 46{,}445-conversation corpus. DBCV $= 0.547$ exceeds the 0.30 threshold Moulavi et al.\ recommend as indicating meaningful density structure. Davies-Bouldin of 0.240 reflects clusters that are compact internally and well-separated from one another. Calinski-Harabasz of 382{,}279 is approximately 101 times higher than the best TF-IDF baseline. The hyperparameter sweep (Section~\ref{sec:method-cluster}) confirms stability: the five next-best configurations achieve Silhouette $0.67$--$0.80$ and noise $3$--$29\%$, so the reported setting is not an isolated maximum.
+
+The 12\% noise rate (20{,}346 chunks) is a feature of HDBSCAN, not a flaw: borderline and ambiguous chunks are correctly excluded, keeping intra-cluster coherence high. K-Means and Ward force every point into a cluster regardless of fit, which is why they show 0\% noise but substantially lower Silhouette.
+
+High-confidence chunks (HDBSCAN membership probability $\geq 0.70$) number 116{,}371 (68.6\% of all chunks) and achieve Silhouette $= 0.860$ and UMAP Silhouette $= 0.863$, confirming that cluster cores are highly cohesive.
+
+Effect of contrastive fine-tuning. The initial clustering run on base (non-fine-tuned) multilingual embeddings with the UMAP and HDBSCAN configuration described in Section~\ref{sec:method-cluster} produces 23 clusters with approximately 47\% noise. Two-stage bootstrapped fine-tuning raises the final cosine Silhouette to 0.804 and reduces noise to 12\% (a fourfold reduction relative to the initial run) without any human-labelled training data. The sole supervision signal is the cluster structure of the embedding space itself.
+
+Comparison with conversation-level clustering. The prior experiment (Section~\ref{sec:prelim}) achieved Silhouette $\leq 0.091$ and 34\% noise. The chunk-level pipeline achieves Silhouette $= 0.804$ (an 8.8-fold improvement) and 12\% noise on the same corpus with a smaller 384-D encoder, confirming that the gain comes from representation granularity rather than model size.
+
+Figure~\ref{fig:umap} illustrates the qualitative effect of contrastive fine-tuning. The base-model projection (left panel) shows overlapping, diffuse regions with substantial noise. The fine-tuned projection (right panel) shows compact, well-separated clusters with clear inter-cluster gaps corresponding to the 24 discovered intent types.
+
+\begin{figure*}[!t]
+  \centering
+  \begin{minipage}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{umap_scatter_base.png}
+    \vspace{0.5ex}
+    {\small (a) Base embeddings before fine-tuning
+      (initial run: noise $\approx 47\%$, 23 clusters)}
+  \end{minipage}
+  \hfill
+  \begin{minipage}[t]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{umap_scatter_finetuned.png}
+    \vspace{0.5ex}
+    {\small (b) Contrastively fine-tuned embeddings
+      (Silhouette $= 0.804$, noise $= 12\%$)}
+  \end{minipage}
+  \caption{2-D UMAP projection of 169{,}709 chunk embeddings before (left) and after (right) contrastive domain fine-tuning. Each point is one semantic chunk, coloured by HDBSCAN cluster assignment; grey points are noise. The five largest clusters are labelled with their generated title. Contrastive fine-tuning tightens intra-cluster density and widens inter-cluster separation without changing the UMAP or HDBSCAN hyperparameters.}
+  \label{fig:umap}
+\end{figure*}
+
+Average intra-cluster cosine similarity across all 24 clusters has a corpus-wide mean of 0.953, ranging from 0.978 (C3, Agent Session Closing) to 0.876 (C2, General Platform Access Errors). Every cluster exceeds 0.87, far above general-domain clustering benchmarks, confirming that semantic chunking combined with contrastive fine-tuning produces internally coherent groups across all intent types.
+
+\subsection{Discovered Intent Clusters}
+
+The 24 discovered clusters correspond to interpretable, operationally meaningful support topics. Table~\ref{tab:clusters} presents all 24 clusters ranked by chunk volume, with their Gemini-generated descriptive titles and chunk-weighted headline failure rates.
+
+\begin{table}[!t]
+\caption{All 24 Intent Clusters Ranked by Chunk Volume}
+\label{tab:clusters}
+\centering
+\begin{tabular}{clcc}
+\toprule
+ID & Cluster Title & Chunks & Fail\% \\
+\midrule
+C11 & Domain Purchase and Registration      & 10{,}609 & 16.5 \\
+C8  & Human Agent Escalation Requests       & 10{,}499 & 13.0 \\
+C20 & Website Down HTTP Error Diagnosis     &  8{,}774 & 19.2 \\
+C16 & AI Builder Site Generation Editing    &  8{,}763 & 10.3 \\
+C13 & Account and WordPress Login           &  7{,}998 & 12.6 \\
+C2  & General Platform Access Errors        &  7{,}926 & 12.3 \\
+C15 & AI Builder Layout and Styling         &  7{,}900 & 14.5 \\
+C12 & Page Speed Optimization Help          &  7{,}434 & 14.6 \\
+C18 & Website Migration to 10Web            &  7{,}152 & 13.9 \\
+C14 & Subscription Plan Features Limits     &  6{,}573 & 14.1 \\
+C22 & Multilingual AI Builder Assistance    &  6{,}261 &  8.7 \\
+C21 & Website Disappearing Visibility Issues &  6{,}068 & 15.6 \\
+C1  & Billing Payment and Renewal           &  5{,}388 & 12.8 \\
+C6  & WooCommerce eCommerce Store Setup     &  5{,}213 & 15.0 \\
+C7  & Free Trial and Plan Restrictions      &  5{,}011 & 18.0 \\
+C10 & SSL Certificate Installation Errors   &  4{,}948 & 16.5 \\
+C17 & DNS Nameserver Pointing Setup         &  4{,}867 &  9.6 \\
+C4  & Refund Requests and Disputes          &  4{,}686 & 12.8 \\
+C9  & Cloudflare CDN and DNS Issues         &  4{,}491 & 18.7 \\
+C3  & Agent Session Closing Conversations   &  4{,}115 &  8.8 \\
+C5  & Email Hosting and MX Records          &  4{,}021 & 13.1 \\
+C0  & Contact Form Email Delivery           &  3{,}956 & 14.7 \\
+C19 & AI Builder Site Replication           &  3{,}567 & 11.9 \\
+C23 & Basic Website Creation Help           &  3{,}143 & 10.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 24 clusters cover the main functional areas of the support corpus. DNS and domain topics form a natural family across three clusters (C9, C11, C17), which correspond to the substages of domain registration, CDN configuration, and nameserver delegation. The AI website builder splits into three separate clusters (C15, C16, C19) because users hit distinct problem types at different stages of the build process. Billing and subscription topics split by specificity: C1 (Billing Payment), C7 (Free Trial Restrictions), C14 (Subscription Features), and C4 (Refund Disputes).
+
+The two highest-volume clusters (C11, 10{,}609 chunks; C8, 10{,}499 chunks) are not the highest-risk ones: C20, C9, and C7 sit in the mid-to-lower volume range but carry the three highest chunk-weighted failure rates. This disconnect between volume and failure rate is the core operational finding of the analysis. A team that prioritised clusters by raw volume would focus on C11 and C8 first; chunk-weighted failure attribution redirects that priority to the three high-risk clusters, where the chatbot most systematically fails. The cross-lingual structure is consistent with the domain-adapted embedding model grouping semantically equivalent queries across languages into the same cluster: C22, C23, and C17 draw the largest non-English traffic (Spanish, French, Persian), while the remaining 21 clusters are English-dominated, confirming that cluster membership reflects topic content rather than language identity.
+
+\subsection{Chatbot Failure Analysis}
+\label{sec:failure-results}
+
+Table~\ref{tab:failure} summarises the three-tier failure classification.
+
+\begin{table}[!t]
+\caption{Three-Tier Failure Classification ($n{=}46{,}445$ conversations)}
+\label{tab:failure}
+\centering
+\begin{tabular}{lrrl}
+\toprule
+Failure Signal & Count & \% & Tier \\
+\midrule
+Confirmed: negative rating ($-1$)    & 2{,}245 & 4.8 & T1 \\
+Probable: repetition loop signal     &   345   & 0.7 & T2 \\
+Probable: unserved agent request     & 1{,}002 & 2.2 & T2 \\
+\quad overlap (both signals)         &     1   & $<$0.1 & T2 \\
+\textit{Unique T2 conversations}     & \textit{1{,}246} & \textit{2.7} & T2 \\
+\midrule
+Headline (T1 $\cup$ T2)     & 3{,}491 & 7.5 & \\
+Suspected: escalated/abandoned       & N/A & N/A & T3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The headline failure rate of 7.5\% is a conservative lower bound: it excludes Tier 3 suspected failures and counts each conversation at most once. T1 and T2 are mutually exclusive by construction: conversations with a negative rating are T1 regardless of whether they also exhibit behavioural signals; T2 applies only to unrated, unescalated conversations. Approximately 100 conversations exhibit behavioural signals but carry a negative rating and are thus classified T1, which accounts for the gap between the raw signal union (1{,}346) and the unique T2 count (1{,}246).
+
+Chunk-weighted failure rates are essential for correct cluster ranking. The clearest case is C3 (Agent Session Closing Conversations): conversation-level attribution inflates its apparent failure rate to near 99.7\% because every failing conversation that touches C3 assigns its signal there, yet the chunk-weighted rate is 8.8\%. The maximum overestimate across all clusters is 11-fold, making chunk-weighting a methodologically necessary correction, not an incremental refinement.
+
+The three highest chunk-weighted headline failure rate clusters are C20 ``Website Down HTTP Error Diagnosis'' (19.2\%), C9 ``Cloudflare CDN and DNS Issues'' (18.7\%), and C7 ``Free Trial and Plan Restrictions'' (18.0\%). These three clusters directly identify the knowledge-base interventions needed. For C20, the chatbot lacks sufficiently specific troubleshooting scripts covering the range of HTTP error codes associated with hosting and server configuration failures. For C9, deeper Cloudflare-specific guidance including DNS propagation timelines and CDN cache invalidation procedures is missing. For C7, users appear to encounter friction at the plan-upgrade decision point, suggesting that the chatbot's responses to free trial limitations do not address user objections with adequate specificity.
+
+Figure~\ref{fig:failure} shows all 24 clusters ranked by chunk-weighted failure rate; the three clusters at or above 18\% (C20, C9, C7) are clearly separated from the remainder (8.7--16.5\%). Even the best-performing cluster (C22, 8.7\%) has a meaningful fraction of unresolved conversations, so knowledge-base improvements are warranted broadly.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\columnwidth]{failure_by_cluster_multilingual.png}
+  \caption{Chunk-weighted headline failure rate (\%) for all 24 intent clusters, ranked highest to lowest. The dashed line marks the 7.5\% corpus average. Rates use chunk count as the denominator, not conversation count, correcting the up-to-11-fold overestimation from conversation-level attribution.}
+  \label{fig:failure}
+\end{figure}
+
+Failure rates by language. Among the 15 languages with at least 30 conversations, Traditional Chinese exhibits the highest headline failure rate (13.3\%), while English, with 40{,}104 conversations, records 8.0\%. All rates are reported with Wilson 95\% confidence intervals; estimates for small language groups carry wide intervals and should be treated cautiously. The spread across languages most likely reflects product feature coverage gaps for specific user segments rather than failures in the embedding model's cross-lingual transfer, since the cluster structure itself is demonstrably cross-lingual.
+
+\subsection{Cluster Routing and Business Impact}
+\label{sec:routing}
+
+Cluster labels are generated post-hoc by prompting Gemini~2.5~Flash~\cite{gemini2025} with a sample of representative chunks from each cluster. This step has no effect on the clustering geometry or metrics; it produces human-readable titles so that product and support teams can act on the results without reading raw embeddings.
+
+The business case for chunk-weighted analysis is concrete. Across all 24 clusters, 3{,}491 conversations are classified as headline failures (T1 $\cup$ T2), with another 30--40\% of all conversations escalated to a human agent each week. Correctly attributing that failure signal to the intent clusters that caused it allows support engineering teams to write targeted knowledge-base articles, re-rank chatbot response candidates, or route high-risk topic types to a specialised agent queue before the conversation deteriorates. The pipeline delivers that prioritised triage list directly: the three clusters at the top of the failure ranking represent specific, addressable knowledge gaps, not diffuse product quality issues.
+
+Failure rate alone does not reveal where intervention is most warranted. Figure~\ref{fig:escalation} maps all 24 clusters by chunk volume (x-axis), escalation rate (y-axis), and total failing chunks (bubble area), with colour encoding the responsible team. C11 and C20 carry the largest bubbles (most absolute failing-chunk volume); C3 is the isolated high-escalation outlier with a small bubble, confirming the 11-fold attribution artefact; C7 ranks third by failure rate but falls to mid-table on bubble size.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\columnwidth]{escalation_map.png}
+  \caption{Cluster escalation map. Each bubble is one intent cluster; x-axis = chunk volume, y-axis = escalation rate (\%), bubble area $\propto$ total failing chunks (business impact score). Colour indicates responsible team. Large bubbles in the upper-right quadrant are the highest-priority intervention targets: they combine high volume, high escalation, and high absolute failing-chunk counts.}
+  \label{fig:escalation}
+\end{figure}
+
+Figure~\ref{fig:breakdown} decomposes the headline failure signal for the ten worst-performing clusters into three operational components. C11 and C20 are dominated by long-unresolved volume, pointing to KB content gaps; C7 has an unusually large agent-request stack, indicating users bypass the chatbot's free-trial responses rather than engaging with them.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\columnwidth]{failure_breakdown_top10.png}
+  \caption{Failure breakdown for the ten worst-performing clusters by chunk-weighted headline failure rate. Each bar's three stacks are long-unresolved conversations (light grey), Tier~1 confirmed thumbs-down failures (light blue), and Tier~2 unserved agent-handoff requests (navy). The three components map to distinct levers: KB content for long-unresolved volume, chatbot response-quality work for confirmed failures, and escalation triggers or pre-emptive KB for agent requests.}
+  \label{fig:breakdown}
+\end{figure}
+
+\subsection{Temporal Analysis and Forecasting}
+\label{sec:temporal}
+
+Volume trajectory. Weekly conversation volume peaked at 2{,}076 in the week of 25 May 2025, then declined to approximately 1{,}275 per week by November 2025, a 43\% reduction from the peak. The post-launch normalisation constitutes a structural break that dominates all 31-week cluster time series and is the primary factor shaping both the trend analysis and the forecasting results. 
+OLS cluster trend classification. Table~\ref{tab:trends} presents the five steepest-declining clusters by OLS slope. Across all 24 clusters, 13 show statistically significant declining chunk volume (OLS slope $< -0.05$ chunks per week, $p < 0.05$), 11 are stable, and 0 show significant growth.
+
+\begin{table}[!t]
+\caption{Top 5 Declining Clusters by OLS Slope on Weekly Chunk Count}
+\label{tab:trends}
+\centering
+\begin{tabular}{lcc}
+\toprule
+Cluster Title & Slope (chunks/wk) & $p$-value \\
+\midrule
+Account and WordPress Login          & $-0.724$ & 0.0048 \\
+Domain Purchase and Registration     & $-0.655$ & 0.0051 \\
+Website Down HTTP Error Diagnosis    & $-0.600$ & 0.0001 \\
+AI Builder Layout and Styling        & $-0.497$ & 0.0046 \\
+General Platform Access Errors       & $-0.472$ & 0.0014 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+High-volume onboarding topics such as account login (C13) and domain registration (C11) decline most rapidly as the user base stabilises, while technical clusters such as C20 fall from the initial spike but remain relatively elevated throughout the window.
+
+Forecasting accuracy (daily chunk counts). Table~\ref{tab:forecasting} reports expanding-window cross-validation accuracy on daily chunk counts for all three models across the six largest clusters (11 folds per cluster, minimum training window 56 days). At daily granularity, intra-week seasonality is observable and exploitable. Prophet with weekly seasonality reaches a volume-weighted MAE of 10.71 chunks per day. That beats naive persistence (wMAE 15.12) by 29\% and Holt-Winters (wMAE 11.14) by 4\%. Prophet's MASE of 0.736 means it also beats the seasonal naive (lag-7 persistence) by 26\%, so the gain is not an artefact of a weak baseline. ETS with a 7-day seasonal period also beats naive (MASE 0.753). Both models pick up the weekday--weekend demand cycle; that cycle is what drives the accuracy gain.
+
+\begin{table}[!t]
+\caption{Daily Chunk Forecasting Accuracy (6 clusters, 11-fold expanding-window CV, chunks per day). wMAE weights each cluster's error by its share of total chunk traffic. MASE $<1$ indicates the model outperforms the seasonal naive (lag-7).}
+\label{tab:forecasting}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Model & MAE & wMAE & MAPE\% & MASE \\
+\midrule
+Naive (last-day)                  & 15.18 & 15.12 & 50.5 & 1.047 \\
+ETS (Holt-Winters, 7-day)         & 11.13 & 11.14 & 32.4 & 0.753 \\
+Prophet (weekly seas.)   & 10.64 & 10.71 & 31.6 & 0.736 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:forecast} shows daily chunk volume with the Prophet forecast and 95\% uncertainty interval for cluster C11, the largest cluster and a representative example of post-launch normalisation. The weekday--weekend cycle is visible in the daily series; the 14-day holdout window for the final fold illustrates typical forecast behaviour during the post-spike normalisation period. Forecast accuracy across all six largest clusters is reported in Table~\ref{tab:forecasting}.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\columnwidth]{daily_chunk_forecast_plot.png}
+  \caption{Daily chunk volume (observed) and Prophet forecast with 95\% uncertainty interval for cluster C11 (Domain Purchase and Registration), one of the six largest clusters and a representative example of the post-launch normalisation pattern. The weekday--weekend demand cycle (Monday peaks, weekend troughs) is captured in the daily series; the shaded region at the right is the held-out 14-day forecasting window from the final cross-validation fold. Forecast accuracy across all six largest clusters and 11 folds is summarised in Table~\ref{tab:forecasting}.}
+  \label{fig:forecast}
+\end{figure}
+
+Weekly-level sensitivity. At weekly granularity, naive persistence wins (MAE 37.29 vs.\ auto-ARIMA 41.04, ETS 42.19, Prophet 46.51): the May--June launch spike induces a downward trend that parametric models project forward, while naive holds the last observation~\cite{makridakis2018m4}. Weekly aggregation also discards the intra-week cycle that gives seasonal models their edge. A post-spike analysis (first five weeks excluded) confirms non-seasonal ETS beats naive on 3 of 6 clusters, consistent with the requirement that at least two seasonal cycles precede seasonal model identification~\cite{hyndman2021fpp3}.
+
+\section{Analysis and Validation}
+\label{sec:analysis}
+
+\subsection{Answers to Research Questions}
+
+RQ1: Sub-conversation chunking combined with contrastive fine-tuning closes the gap between structurally incoherent and operationally meaningful cluster solutions on this corpus. The chunk-level pipeline reaches Silhouette $= 0.804$, DBCV $= 0.547$, and 12\% noise across 24 clusters on the same 46{,}445-conversation corpus where the conversation-level baseline reaches Silhouette $\leq 0.091$ and 34\% noise — an 8.8-fold Silhouette improvement that cannot be attributed to model size, since the baseline already uses a larger 768-D encoder. Each of the 24 Gemini-labelled clusters maps to a distinct operational support topic, confirming that the discovered structure is substantively interpretable rather than an artefact of the algorithm. The granularity shift from full conversation to coherent sub-segment is the decisive factor.
+
+RQ2: the three highest chunk-weighted failure clusters are Website Down HTTP Error Diagnosis (19.2\%), Cloudflare CDN and DNS Issues (18.7\%), and Free Trial and Plan Restrictions (18.0\%), all separated from the remainder (8.7--16.5\%). Conversation-level attribution overstates per-cluster risk by up to 11-fold: C3 (Agent Session Closing) inflates from 8.8\% chunk-weighted to ${\sim}$99\% conversation-level because every failing conversation whose chunks land in C3 also touched that cluster at some point.
+
+RQ3: chunking and contrastive fine-tuning are synergistic rather than separable. Applying the UMAP and HDBSCAN configuration to base (non-fine-tuned) MiniLM chunk embeddings produces 23 clusters with ${\approx}47\%$ noise, slightly worse than the 34\% noise of the conversation-level baseline on the same corpus. Chunking alone, without domain adaptation, does not improve cluster quality because the off-the-shelf embedding model was not trained to separate support-specific vocabulary from general-domain language. Adding two-stage contrastive fine-tuning, with all UMAP and HDBSCAN hyperparameters held fixed, drops noise to 12\% and raises cosine Silhouette to 0.804, a fourfold noise reduction relative to the base chunk run. The mechanism is that chunking provides topically coherent units that fine-tuning can learn to separate; fine-tuning provides the domain-specific proximity signal that makes chunk-level granularity exploitable by density-based clustering. Neither step alone crosses the quality threshold; the combination does. The second bootstrap round benefits from the cleaner pseudo-labels produced by the first, confirming the procedure converges rather than oscillates, and no human-annotated pair enters at any stage.
+
+RQ4: Daily chunk counts are the granularity at which per-cluster volume can be forecast with accuracy exceeding the seasonal naive. Prophet with weekly seasonality achieves wMAE $= 10.71$ chunks/day (MASE $= 0.736$) across the six largest clusters, outperforming naive persistence by 29\% and the seasonal naive by 26\%; Holt-Winters ETS follows closely (wMAE 11.14, MASE 0.753). At weekly granularity, naive persistence wins (MAE 37.29 vs.\ Prophet 46.51) because weekly aggregation discards the weekday--weekend cycle that drives the accuracy advantage, and the 31-week window is dominated by the May--June launch spike that parametric models project forward. The divergence in model rankings is therefore explained by whether the intra-week seasonal structure remains visible after aggregation.
+
+\subsection{Validation Against Published Baselines}
+
+Cluster quality. Direct numerical comparison across unsupervised intent discovery studies is limited by corpus, embedding space, and metric heterogeneity. Zhang et al.~\cite{zhang2021new} and Perkins and Yang~\cite{perkins2019dialog} evaluate on standard intent benchmarks (BANKING77, SNIPS, ATIS) under semi-supervised protocols where ground-truth intent labels provide Normalised Mutual Information, Adjusted Rand Index, and cluster accuracy as primary metrics. These metrics require human-assigned labels that do not exist for the 10Web corpus, so direct comparison is not possible. The most rigorous comparison in this study is the within-corpus controlled experiment of Section~\ref{sec:prelim}: the Google multilingual embedding model family, the 46{,}445-conversation corpus, and HDBSCAN are all held fixed; only the representation granularity changes from full conversation to sub-conversation chunk. The 8.8-fold Silhouette gain (0.077 to 0.804) and the threefold noise reduction (34\% to 12\%) isolate the granularity effect from every other factor.
+
+Silhouette $= 0.804$ substantially exceeds Rousseeuw's~\cite{rousseeuw1987silhouettes} strong-cluster threshold of 0.70. DBCV $= 0.547$ exceeds the 0.30 threshold that Moulavi et al.~\cite{moulavi2014dbcv} recommend as evidence of meaningful density-connected structure; DBCV is measured in the UMAP manifold rather than in the fine-tuned cosine space, so it does not depend on the same geometry that the contrastive training objective optimised. TF-IDF baselines (Silhouette 0.143--0.147, DBCV not computable for centroid methods) confirm the improvement is not explained by differences in cluster count or algorithm class.
+
+Contrastive fine-tuning. The two-stage bootstrapped procedure reduces noise from 47\% to 12\% across two rounds without human-annotated training pairs. Gao et al.~\cite{gao2021simcse} show that MNRL contrastive objectives with in-batch negatives substantially improve embedding geometry on sentence similarity benchmarks; the present result extends that finding to a setting where the supervision signal is HDBSCAN pseudo-labels rather than curated pairs, confirming the principle transfers to annotation-free scenarios. The improvement across two bootstrap rounds, with the second round benefiting from the cleaner pseudo-labels produced by the first, is consistent with the theoretical expectation for iterative self-training: successive rounds improve as long as label noise decreases monotonically.
+
+Forecasting. Prophet at daily granularity reaches MASE $= 0.736$ across the six largest clusters under 11-fold expanding-window cross-validation. The M4 Competition~\cite{makridakis2018m4} found that top-performing seasonal univariate methods at daily frequency typically achieve MASE in the 0.8--1.0 range on general-purpose business time series; the present result sits at the favourable end of that range, reflecting the strong and regular weekday--weekend demand cycle in the support corpus.
+\subsection{Limitations and Open Items}
+
+The pipeline of Section~\ref{sec:methodology} is implemented end-to-end on the 169{,}709-chunk corpus: de-identification, semantic chunking, embedding model selection, two-stage contrastive fine-tuning, UMAP dimensionality reduction, HDBSCAN clustering, three-tier failure attribution, chunk-weighted failure rate computation, OLS trend analysis, and Prophet and ETS forecasting cross-validation all ran to completion and produced the outputs reported in Sections~V and VI.
+
+The 7-month observation window limits the temporal analysis. The 31-week series is dominated by the May--June launch spike, which masks steady-state volume patterns and prevents reliable seasonal model identification; at minimum 12 months of post-stabilisation data is needed before seasonal specifications are meaningful.
+
+The failure taxonomy relies on proxy behavioural signals rather than human-annotated ground truth. Tier~2 failures are identified from repetition loops and agent-request regex patterns; these signals have known precision limitations and may miss failures that do not generate observable behavioural traces. The contrastive fine-tuning evaluation is also intrinsic only: extrinsic evaluation against expert-assigned intent labels via Normalised Mutual Information or Adjusted Rand Index would provide ground-truth validation, but no such labels exist for this corpus. Producing them is the main future-work item.
+
+The $min\_cluster\_size{=}2{,}000$ hyperparameter means that intent groups attracting fewer than 2{,}000 chunks over the study window are classified as noise rather than assigned to a cluster. This is a deliberate choice that prioritises intra-cluster purity over coverage, but it renders small, emerging topics invisible to the downstream failure analysis until they grow large enough to pass the density threshold. The pipeline is also validated on a single product (10Web, a WordPress hosting platform with an English-dominant user base of 86.3\%); its performance on other SaaS verticals or corpora with more balanced language distributions has not been established.
+
+The cluster Silhouette of 0.804 is measured in cosine space after fine-tuning with a contrastive cosine objective, so the training signal optimises the metric used for evaluation; the DBCV score of 0.547, computed in the UMAP manifold without direct optimisation pressure, is a more conservative estimate that is not subject to this circular dependency.
+
+\subsection{Technical Task Completion}
+\label{sec:tasks}
+
+All pipeline stages described in Section~\ref{sec:methodology} ran to completion on the 169{,}709-chunk corpus: three-step de-identification (\texttt{02\_deidentify.sql}), coherence-threshold semantic chunking (\texttt{scripts/semantic\_chunker.py}), four-model embedding selection, two-stage bootstrapped MNRL contrastive fine-tuning (\texttt{scripts/contrastive\_finetune.py}), a 90-configuration HDBSCAN sweep (\texttt{scripts/chunk\_clustering.py}), three-tier failure attribution (\texttt{05\_failure\_analysis.sql}), OLS trend analysis (\texttt{09\_declining\_clusters.sql}), and 11-fold expanding-window daily forecasting (\texttt{notebooks/07\_forecasting.ipynb}). All outputs are reported in Sections~V and~VI.
+
+Three items were not completed. Extrinsic evaluation against NMI or ARI requires expert-annotated intent labels for the corpus, which do not exist; producing them is the next planned step. Per-chunk machine translation was skipped because the multilingual embedding model handles all 93 languages natively, and adding translation errors at chunk granularity would likely hurt rather than help. Reliable long-term seasonal forecasting needs a longer observation window: the 31-week series is still dominated by the May--June 2025 launch spike, which leaves too few stable cycles for reliable seasonal model fitting.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Sub-conversation semantic chunking, combined with two-stage bootstrapped contrastive fine-tuning on HDBSCAN pseudo-labels and density-based clustering, beats both TF-IDF baselines and conversation-level approaches for intent discovery on multilingual SaaS support. The 24-cluster solution achieves Silhouette $= 0.804$ and DBCV $= 0.547$ on 169{,}709 chunks, which is an 8.8-fold Silhouette improvement over the conversation-level baseline on the same 46{,}445-conversation corpus, and noise drops from 47\% to 12\% without any human labels. Chunk-weighted failure attribution identifies Website Down HTTP Error Diagnosis (19.2\%), Cloudflare CDN and DNS Issues (18.7\%), and Free Trial and Plan Restrictions (18.0\%) as the three highest-priority knowledge-base targets, and corrects up to 11-fold conversation-level overestimation of cluster risk. Thirteen of 24 clusters declined significantly over the 31-week post-launch window, and Prophet with weekly seasonality (wMAE $= 10.71$ chunks/day, MASE $= 0.736$) beats naive persistence by 29\% on daily chunk volumes, making intra-week demand forecastable for operational planning. The pipeline needs no annotation and runs on open-source components.
+
+Several extensions are immediate priorities. The most pressing is extrinsic validation: annotating a stratified sample of chunks across all 24 clusters with expert-assigned intent labels would enable Normalised Mutual Information and Adjusted Rand Index scores as ground-truth complements to the intrinsic Silhouette and DBCV metrics reported here. A second priority is the observation window: the current 31-week series is dominated by the May--June 2025 launch spike; extending the data to 12 months of post-stabilisation volume would allow reliable weekly seasonal model identification and reduce the influence of the structural break on OLS trend slopes. On the product side, three DNS-adjacent clusters (C9 Cloudflare CDN, C11 Domain Purchase, C17 DNS Nameserver) form a natural merge candidate: collapsing them into a single DNS action cluster and handing it to a dedicated Engineering KB team would translate the cluster taxonomy directly into a support workflow improvement. Broader generalisation requires running the full pipeline on at least two other SaaS products with different user bases and language compositions; the current results are validated on a single English-dominant WordPress hosting corpus, and transferability to sectors with more balanced multilingual traffic remains an open question. One technical direction also remains open: six deep clustering methods (autoencoder, DEC, VAE, parametric UMAP, T-CNE, and RBM) were tested at conversation level but ran into the short-query representation problem that chunk-level segmentation addresses; running them on fine-tuned chunk embeddings would show whether any parametric approach can match HDBSCAN at chunk granularity.
+
+\section*{Acknowledgment}
+
+The author thanks 10Web Inc.\ for access to the customer support data, and Armen Saghatelian for his guidance and supervision throughout this work.
+
+\begin{thebibliography}{99}
+\setlength{\itemsep}{0pt}
+\setlength{\parskip}{0pt}
+
+\bibitem{adamopoulou2020chatbot}
+E.~Adamopoulou and L.~Moussiades,
+``An overview of chatbot technology,''
+in \emph{IFIP Int. Conf. on Artificial Intelligence Applications and
+Innovations (AIAI)}, IFIP AICT vol.~584, Springer, 2020, pp.~373--383.
+
+\bibitem{xu2017new}
+A.~Xu, Z.~Liu, Y.~Guo, V.~Sinha, and R.~Akkiraju,
+``A new chatbot for customer service on social media,''
+in \emph{Proc. 2017 CHI Conf. on Human Factors in Computing Systems},
+2017, pp.~3506--3510.
+
+\bibitem{perkins2019dialog}
+H.~Perkins and Y.~Yang,
+``Dialog Intent Induction with deep multi-view clustering,''
+in \emph{Proc. 2019 Conf. on Empirical Methods in Natural Language
+Processing and 9th Int. Joint Conf. on Natural Language Processing
+(EMNLP-IJCNLP)}, 2019, pp.~4016--4025.
+
+\bibitem{reimers2019sentence}
+N.~Reimers and I.~Gurevych,
+``Sentence-BERT: Sentence embeddings using Siamese BERT-networks,''
+in \emph{Proc. 2019 Conf. on Empirical Methods in Natural Language
+Processing and 9th Int. Joint Conf. on Natural Language Processing
+(EMNLP-IJCNLP)}, 2019, pp.~3982--3992.
+
+\bibitem{gao2021simcse}
+T.~Gao, X.~Yao, and D.~Chen,
+``SimCSE: Simple contrastive learning of sentence embeddings,''
+in \emph{Proc. 2021 Conf. on Empirical Methods in Natural Language
+Processing (EMNLP)}, 2021, pp.~6894--6910.
+
+\bibitem{wang2020minilm}
+W.~Wang, F.~Wei, L.~Dong, H.~Bao, N.~Yang, and M.~Zhou,
+``MiniLM: Deep self-attention distillation for task-agnostic
+compression of pre-trained transformers,''
+in \emph{Advances in Neural Information Processing Systems (NeurIPS)},
+vol.~33, 2020, pp.~5776--5788.
+
+\bibitem{mcinnes2018umap}
+L.~McInnes, J.~Healy, and J.~Melville,
+``UMAP: Uniform manifold approximation and projection for dimension
+reduction,''
+\emph{arXiv preprint arXiv:1802.03426}, 2018.
+
+\bibitem{campello2013density}
+R.~J.~G.~B.~Campello, D.~Moulavi, and J.~Sander,
+``Density-based clustering based on hierarchical density estimates,''
+in \emph{Pacific-Asia Conf. on Knowledge Discovery and Data Mining
+(PAKDD)}, Springer, 2013, pp.~160--172.
+
+\bibitem{mcinnes2017hdbscan}
+L.~McInnes, J.~Healy, and S.~Astels,
+``hdbscan: Hierarchical density based clustering,''
+\emph{The Journal of Open Source Software},
+vol.~2, no.~11, p.~205, 2017.
+
+\bibitem{rousseeuw1987silhouettes}
+P.~J.~Rousseeuw,
+``Silhouettes: A graphical aid to the interpretation and validation
+of cluster analysis,''
+\emph{Journal of Computational and Applied Mathematics},
+vol.~20, pp.~53--65, 1987.
+
+\bibitem{davies1979cluster}
+D.~L.~Davies and D.~W.~Bouldin,
+``A cluster separation measure,''
+\emph{IEEE Trans. Pattern Analysis and Machine Intelligence},
+vol.~PAMI-1, no.~2, pp.~224--227, 1979.
+
+\bibitem{calinski1974dendrite}
+T.~Calinski and J.~Harabasz,
+``A dendrite method for cluster analysis,''
+\emph{Communications in Statistics},
+vol.~3, no.~1, pp.~1--27, 1974.
+
+\bibitem{moulavi2014dbcv}
+D.~Moulavi, P.~A.~Jaskowiak, R.~J.~G.~B.~Campello, A.~Zimek,
+and J.~Sander,
+``Density-based clustering validation,''
+in \emph{Proc. 2014 SIAM Int. Conf. on Data Mining (SDM)},
+2014, pp.~839--847.
+
+\bibitem{taylor2018forecasting}
+S.~J.~Taylor and B.~Letham,
+``Forecasting at scale,''
+\emph{The American Statistician},
+vol.~72, no.~1, pp.~37--45, 2018.
+
+\bibitem{makridakis2018m4}
+S.~Makridakis, E.~Spiliotis, and V.~Assimakopoulos,
+``The M4 Competition: 100{,}000 time series and 61 forecasting
+methods,''
+\emph{International Journal of Forecasting},
+vol.~36, no.~1, pp.~54--74, 2020.
+
+\bibitem{hyndman2021fpp3}
+R.~J.~Hyndman and G.~Athanasopoulos,
+\emph{Forecasting: Principles and Practice}, 3rd ed.,
+OTexts, 2021.
+[Online]. Available: \url{https://otexts.com/fpp3/}
+
+\bibitem{diebold1995dm}
+F.~X.~Diebold and R.~S.~Mariano,
+``Comparing predictive accuracy,''
+\emph{Journal of Business and Economic Statistics},
+vol.~13, no.~3, pp.~253--263, 1995.
+
+\bibitem{deerwester1990indexing}
+S.~Deerwester, S.~T.~Dumais, G.~W.~Furnas, T.~K.~Landauer,
+and R.~Harshman,
+``Indexing by latent semantic analysis,''
+\emph{Journal of the American Society for Information Science},
+vol.~41, no.~6, pp.~391--407, 1990.
+
+\bibitem{zhang2021new}
+H.~Zhang, H.~Xu, T.-E.~Wang, M.~Liu, and S.-T.~Zhao,
+``Discovering new intents with deep aligned clustering,''
+in \emph{Proc. AAAI Conf. on Artificial Intelligence},
+vol.~35, no.~16, 2021, pp.~14365--14373.
+
+\bibitem{liu2016attention}
+B.~Liu and I.~Lane,
+``Attention-based recurrent neural network models for joint intent
+detection and slot filling,''
+in \emph{Proc. Interspeech 2016}, 2016, pp.~685--689.
+
+\bibitem{brandtzaeg2017people}
+P.~B.~Brandtzaeg and A.~F{\o}lstad,
+``Why people use chatbots,''
+in \emph{Internet Science: INSCI 2017}, Springer, 2017, pp.~377--392.
+
+\bibitem{mendez2019presidio}
+Microsoft,
+``Presidio: Data Protection and De-identification SDK,'' 2019.
+[Online]. Available: \url{https://github.com/microsoft/presidio}
+
+\bibitem{gemini2025}
+Google DeepMind, ``Gemini 2.5 Flash,'' technical report, 2025.
+\url{https://deepmind.google/technologies/gemini/flash/}
+
+\bibitem{zhang2022intent}
+H.~Zhang, H.~Xu, T.-E.~Lin, and R.~Lyu,
+``New intent discovery with pre-training and contrastive learning,''
+in \emph{Proc. 60th Annual Meeting of the Association for Computational Linguistics (ACL)}, 2022.
+
+\bibitem{wang2024e5}
+L.~Wang, N.~Yang, X.~Huang, L.~Yang, R.~Majumder, and F.~Wei,
+``Multilingual E5 text embeddings: A technical report,''
+\emph{arXiv preprint arXiv:2402.05672}, 2024.
+
+\bibitem{folstad2017chatbots}
+A.~F{\o}lstad and P.~B.~Brandtzaeg,
+``Chatbots and the new world of HCI,''
+\emph{Interactions}, vol.~24, no.~4, pp.~38--42, 2017.
+
+\end{thebibliography}
+
+\end{document}
